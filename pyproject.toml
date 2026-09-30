@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    # pinned from the first green install (Windows, Python 3.11)
+    "cognee==1.6.2",
+    "pymupdf==1.28.2",
+    "pymupdf-layout==1.28.2",
+    "pymupdf4llm==1.28.2",
+    "pytesseract==0.3.13",
+    "Pillow==12.3.0",
+    "openai==2.54.0",
+    "fastapi==0.142.2",
+    "uvicorn==0.54.0",
+    "python-dotenv==1.2.3",
+    # not pinned yet, pin after the first end-to-end run
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = ["reportlab", "pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
