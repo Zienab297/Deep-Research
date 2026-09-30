@@ -1,4 +1,4 @@
-Document Deep Research Platform
+# Document Deep Research Platform
 
 Upload your own PDFs (papers, reports, invoices, scans), build a knowledge graph over them, and get cited, streamed answers. Every component is added only if it beats the baseline on a golden dataset.
 
