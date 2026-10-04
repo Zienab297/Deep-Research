@@ -4,10 +4,22 @@ import time
 from pathlib import Path
 
 from research import config  # must come before cognee (loads .env)
-from research.ingestion.pages import extract_pages
-from research.knowledge import cost
+from research.ingestion.pages import extract
+from research.knowledge import figures
 
 import cognee
+
+# Pages cognified at once. 1 keeps request bursts small, which matters under a
+# per-minute token limit. Raise it when your provider limits allow.
+COGNIFY_DATA_PER_BATCH = 1
+
+# Best-effort markers for "daily budget used up" in provider error text.
+# Unverified against Cognee's wrapped errors: check the first real one you see.
+_DAILY_LIMIT_MARKERS = ("per day", "(tpd)", "(rpd)")
+
+
+class DailyLimitReached(RuntimeError):
+    """The provider's daily budget is used up, so retrying today is pointless."""
 
 
 def configure_cognee() -> None:
@@ -19,48 +31,64 @@ configure_cognee()
 
 
 async def reset() -> None:
-    """Wipe all Cognee data. Use before a clean eval run."""
+    """Wipe all Cognee data and all saved figures. Use before a clean eval run."""
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
+    figures.clear()
 
 
-async def _spend() -> float | None:
-    """Settled OpenRouter spend, or None if it cannot be read (never blocks ingestion)."""
-    try:
-        return await asyncio.to_thread(cost.settled_usage)
-    except Exception as e:
-        print(f"[cost] could not read usage: {e!r}")
-        return None
+def _daily_limit_hit(obj) -> bool:
+    text = str(obj).lower()
+    return any(m in text for m in _DAILY_LIMIT_MARKERS)
 
 
 async def ingest_document(pdf_path, dataset: str = config.DEFAULT_WORKSPACE) -> dict:
-    """Extract pages, add one Cognee item per page, cognify.
+    """Extract pages and figures, add one Cognee item per page, cognify.
 
-    Returns timing and cost stats. cost_usd is None if usage could not be read.
+    Figures (images, captions, in-picture text) go to the local figure catalog,
+    not through Cognee, so they cost no LLM tokens.
+
+    status in the returned dict:
+      ok      cognify returned and its result shows no error text
+      check   cognify returned but the result mentions an error: read cognify_result
+      skipped no page reached MIN_PAGE_CHARS
+    Raises DailyLimitReached when the provider's daily budget is exhausted.
     """
     pdf_path = Path(pdf_path)
 
     t0 = time.perf_counter()
-    pages = await asyncio.to_thread(extract_pages, pdf_path)
+    pages, figs = await asyncio.to_thread(extract, pdf_path)
+    figures.save(pdf_path.name, figs)  # idempotent per file, safe to rerun
     t1 = time.perf_counter()
 
     if not pages:
         return {"file": pdf_path.name, "dataset": dataset, "pages": 0,
+                "figures": len(figs), "status": "skipped",
                 "skipped": "no page reached MIN_PAGE_CHARS"}
 
-    before = await _spend()
-    t2 = time.perf_counter()
     await cognee.add([p.as_document() for p in pages], dataset_name=dataset)
-    await cognee.cognify(datasets=[dataset])
-    t3 = time.perf_counter()
-    after = await _spend()
+    try:
+        result = await cognee.cognify(
+            datasets=[dataset], data_per_batch=COGNIFY_DATA_PER_BATCH
+        )
+    except Exception as e:
+        if _daily_limit_hit(e):
+            raise DailyLimitReached(str(e)[:300]) from e
+        raise
+    t2 = time.perf_counter()
+
+    result_text = str(result)
+    if _daily_limit_hit(result_text):
+        raise DailyLimitReached(result_text[:300])
 
     return {
         "file": pdf_path.name,
         "dataset": dataset,
         "pages": len(pages),
+        "figures": len(figs),
         "chars": sum(len(p.text) for p in pages),
         "extract_s": round(t1 - t0, 1),
-        "cognee_s": round(t3 - t2, 1),
-        "cost_usd": None if before is None or after is None else round(after - before, 4),
+        "cognee_s": round(t2 - t1, 1),
+        "status": "check" if "error" in result_text.lower() else "ok",
+        "cognify_result": result_text[:300],
     }
