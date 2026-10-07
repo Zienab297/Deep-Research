@@ -4,12 +4,13 @@ import time
 from pathlib import Path
 
 from research import config  # must come before cognee (loads .env)
+from research.ingestion.chunks import chunk_pages
 from research.ingestion.pages import extract
 from research.knowledge import figures
 
 import cognee
 
-# Pages cognified at once. 1 keeps request bursts small, which matters under a
+# Items cognified at once. 1 keeps request bursts small, which matters under a
 # per-minute token limit. Raise it when your provider limits allow.
 COGNIFY_DATA_PER_BATCH = 1
 
@@ -31,7 +32,11 @@ configure_cognee()
 
 
 async def reset() -> None:
-    """Wipe all Cognee data and all saved figures. Use before a clean eval run."""
+    """Wipe all Cognee data and all saved figures. Use before a clean eval run.
+
+    Also required after changing the chunking: Cognee dedupes by content, so
+    items from an older chunking would otherwise stay next to the new ones.
+    """
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
     figures.clear()
@@ -43,7 +48,8 @@ def _daily_limit_hit(obj) -> bool:
 
 
 async def ingest_document(pdf_path, dataset: str = config.DEFAULT_WORKSPACE) -> dict:
-    """Extract pages and figures, add one Cognee item per page, cognify.
+    """Extract pages and figures, chunk the text, add one Cognee item per
+    chunk, cognify.
 
     Figures (images, captions, in-picture text) go to the local figure catalog,
     not through Cognee, so they cost no LLM tokens.
@@ -51,7 +57,7 @@ async def ingest_document(pdf_path, dataset: str = config.DEFAULT_WORKSPACE) -> 
     status in the returned dict:
       ok      cognify returned and its result shows no error text
       check   cognify returned but the result mentions an error: read cognify_result
-      skipped no page reached MIN_PAGE_CHARS
+      skipped no chunk could be built (no page reached MIN_PAGE_CHARS)
     Raises DailyLimitReached when the provider's daily budget is exhausted.
     """
     pdf_path = Path(pdf_path)
@@ -59,14 +65,15 @@ async def ingest_document(pdf_path, dataset: str = config.DEFAULT_WORKSPACE) -> 
     t0 = time.perf_counter()
     pages, figs = await asyncio.to_thread(extract, pdf_path)
     figures.save(pdf_path.name, figs)  # idempotent per file, safe to rerun
+    chunks = chunk_pages(pages)
     t1 = time.perf_counter()
 
-    if not pages:
-        return {"file": pdf_path.name, "dataset": dataset, "pages": 0,
-                "figures": len(figs), "status": "skipped",
-                "skipped": "no page reached MIN_PAGE_CHARS"}
+    if not chunks:
+        return {"file": pdf_path.name, "dataset": dataset, "pages": len(pages),
+                "chunks": 0, "figures": len(figs), "status": "skipped",
+                "skipped": "no chunk could be built (no page reached MIN_PAGE_CHARS)"}
 
-    await cognee.add([p.as_document() for p in pages], dataset_name=dataset)
+    await cognee.add([c.as_document() for c in chunks], dataset_name=dataset)
     try:
         result = await cognee.cognify(
             datasets=[dataset], data_per_batch=COGNIFY_DATA_PER_BATCH
@@ -85,8 +92,9 @@ async def ingest_document(pdf_path, dataset: str = config.DEFAULT_WORKSPACE) -> 
         "file": pdf_path.name,
         "dataset": dataset,
         "pages": len(pages),
+        "chunks": len(chunks),
         "figures": len(figs),
-        "chars": sum(len(p.text) for p in pages),
+        "chars": sum(len(c.text) for c in chunks),
         "extract_s": round(t1 - t0, 1),
         "cognee_s": round(t2 - t1, 1),
         "status": "check" if "error" in result_text.lower() else "ok",

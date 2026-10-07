@@ -23,6 +23,9 @@ from pymupdf4llm.helpers.document_layout import OCRMode
 from research import config
 
 OCR_MODE = OCRMode.SELECT_KEEP_OLD
+# Text found inside pictures (axis labels, OCR of diagrams) is kept on the
+# Figure for figure search. Keep it out of the page text unless asked.
+KEEP_PICTURE_TEXT = getattr(config, "KEEP_PICTURE_TEXT", False)
 FIG_DIR = config.DATA_DIR / "figures"
 MIN_FIGURE_SIDE = 100  # px; drops logos and icons
 
@@ -31,6 +34,9 @@ _PICTURE_TEXT = re.compile(
     r"<!-- Start of picture text -->(.*?)<!-- End of picture text -->", re.S
 )
 _BR = re.compile(r"<br\s*/?>")
+_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_FIG_LABEL = re.compile(r"^\s*(fig\.?|figure)\s*\d+", re.I)
+MAX_CAPTION_CHARS = 300
 
 
 @dataclass
@@ -63,15 +69,45 @@ def _rel_to_data(p: Path) -> str:
         return p.resolve().as_posix()
 
 
+def _box_text(text: str, box: dict) -> str:
+    a, b = box["pos"]
+    return " ".join(text[a:b].split())
+
+
+def _fallback_caption(text: str, boxes: list, k: int, claimed: set) -> str:
+    """Caption missed by the 'next caption box' rule (e.g. placed above the
+    picture, or typed as plain text): nearest unclaimed box before or after the
+    picture whose text starts with 'Fig. N' / 'Figure N'."""
+    best, best_d = None, None
+    for j, box in enumerate(boxes):
+        if j == k or j in claimed or "pos" not in box:
+            continue
+        if box.get("class") == "picture":
+            continue
+        if _FIG_LABEL.match(_box_text(text, box)):
+            d = abs(j - k)
+            if best_d is None or d < best_d:
+                best, best_d = j, d
+    if best is None:
+        return ""
+    return _box_text(text, boxes[best])[:MAX_CAPTION_CHARS]
+
+
 def _figures_on_page(file: str, number: int, chunk: dict) -> list[Figure]:
     text = chunk.get("text") or ""
     boxes = chunk.get("page_boxes") or []
-    figs = []
+    # Primary rule: the first caption box after the picture. Sub-figures share
+    # the caption below them.
+    primary = {}
     for k, box in enumerate(boxes):
-        if box.get("class") != "picture":
-            continue
-        start, end = box["pos"]
-        seg = text[start:end]
+        if box.get("class") == "picture":
+            primary[k] = next(
+                (j for j in range(k + 1, len(boxes))
+                 if boxes[j].get("class") == "caption"), None)
+    claimed = {j for j in primary.values() if j is not None}
+    figs = []
+    for k, j in primary.items():
+        seg = text[boxes[k]["pos"][0]:boxes[k]["pos"][1]]
         m = _IMG_REF.search(seg)
         if not m:
             continue  # picture box with no written image
@@ -82,14 +118,10 @@ def _figures_on_page(file: str, number: int, chunk: dict) -> list[Figure]:
             w, h = im.size
         if min(w, h) < MIN_FIGURE_SIDE:
             continue
-        # Caption = first caption box after the picture. Sub-figures share the
-        # caption below them. A caption placed above the picture is missed.
-        caption = ""
-        for nxt in boxes[k + 1:]:
-            if nxt.get("class") == "caption":
-                a, b = nxt["pos"]
-                caption = " ".join(text[a:b].split())
-                break
+        if j is not None:
+            caption = _box_text(text, boxes[j])
+        else:
+            caption = _fallback_caption(text, boxes, k, claimed)
         inner = " ".join(
             " ".join(_BR.sub(" ", t).split()) for t in _PICTURE_TEXT.findall(seg)
         )
@@ -116,8 +148,12 @@ def extract(pdf_path) -> tuple[list[Page], list[Figure]]:
     pages, figures = [], []
     for i, chunk in enumerate(chunks, start=1):
         figures.extend(_figures_on_page(path.name, i, chunk))
-        # Image paths are not content, so keep them out of what Cognee sees.
-        text = _IMG_REF.sub("", chunk.get("text") or "").strip()
+        # Image paths and picture text are not page content: keep them out of
+        # what Cognee sees (figure text is searchable via the figure catalog).
+        text = _IMG_REF.sub("", chunk.get("text") or "")
+        if not KEEP_PICTURE_TEXT:
+            text = _PICTURE_TEXT.sub("", text)
+        text = _COMMENT.sub("", text).strip()
         if len(text) >= config.MIN_PAGE_CHARS:
             pages.append(Page(file=path.name, number=i, text=text))
     return pages, figures
